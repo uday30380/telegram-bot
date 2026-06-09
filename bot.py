@@ -8,6 +8,40 @@ from datetime import datetime, timedelta
 from contextlib import contextmanager
 import dateparser
 from dotenv import load_dotenv
+# Polyfill for Python 3.13+ where imghdr was removed
+try:
+    import imghdr
+except ImportError:
+    import sys
+    from types import ModuleType
+    imghdr = ModuleType("imghdr")
+    def what(file, h=None):
+        if h is None:
+            if isinstance(file, (str, os.PathLike)):
+                try:
+                    with open(file, 'rb') as f:
+                        h = f.read(32)
+                except Exception:
+                    return None
+            else:
+                try:
+                    pos = file.tell()
+                    h = file.read(32)
+                    file.seek(pos)
+                except Exception:
+                    return None
+        if h.startswith(b'\xff\xd8\xff'):
+            return 'jpeg'
+        if h.startswith(b'\x89PNG\r\n\x1a\n'):
+            return 'png'
+        if h.startswith(b'GIF87a') or h.startswith(b'GIF89a'):
+            return 'gif'
+        if h.startswith(b'RIFF') and h[8:12] == b'WEBP':
+            return 'webp'
+        return None
+    imghdr.what = what
+    sys.modules['imghdr'] = imghdr
+
 from telegram import Update, ParseMode, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, CallbackContext, JobQueue, CallbackQueryHandler
 
