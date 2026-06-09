@@ -48,6 +48,7 @@ from telegram.ext import Updater, CommandHandler, CallbackContext, JobQueue, Cal
 # ---------------- CONFIG & LOGGING ----------------
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
 # Fix for Windows console emoji crashes
 import sys
@@ -232,7 +233,19 @@ class DatabaseManager:
 
     def update_timezone(self, chat_id, offset):
         with self._get_conn() as conn:
-            conn.execute("INSERT OR REPLACE INTO user_settings (chat_id, timezone_offset) VALUES (?, ?)", (chat_id, offset))
+            row = conn.execute("SELECT 1 FROM user_settings WHERE chat_id = ?", (chat_id,)).fetchone()
+            if row:
+                conn.execute("UPDATE user_settings SET timezone_offset = ? WHERE chat_id = ?", (offset, chat_id))
+            else:
+                conn.execute("INSERT INTO user_settings (chat_id, timezone_offset) VALUES (?, ?)", (chat_id, offset))
+
+    def update_briefing(self, chat_id, enabled):
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT 1 FROM user_settings WHERE chat_id = ?", (chat_id,)).fetchone()
+            if row:
+                conn.execute("UPDATE user_settings SET briefing_enabled = ? WHERE chat_id = ?", (enabled, chat_id))
+            else:
+                conn.execute("INSERT INTO user_settings (chat_id, briefing_enabled) VALUES (?, ?)", (chat_id, enabled))
 
     # --- GAMIFICATION (XP & LEVELS) ---
     def reward_xp(self, chat_id, amount):
@@ -315,15 +328,65 @@ def get_confirm_keyboard(temp_id):
     return InlineKeyboardMarkup(keyboard)
 
 def get_action_keyboard(reminder_id):
-    keyboard = [[
-        InlineKeyboardButton("✅ Done", callback_data=f"done_{reminder_id}"),
-        InlineKeyboardButton("💤 Snooze (15m)", callback_data=f"snooze_{reminder_id}")
-    ]]
+    keyboard = [
+        [InlineKeyboardButton("✅ Done", callback_data=f"done_{reminder_id}")],
+        [
+            InlineKeyboardButton("💤 Snooze 10m", callback_data=f"snooze_10_{reminder_id}"),
+            InlineKeyboardButton("💤 Snooze 30m", callback_data=f"snooze_30_{reminder_id}"),
+            InlineKeyboardButton("💤 Snooze 1h", callback_data=f"snooze_60_{reminder_id}")
+        ]
+    ]
     return InlineKeyboardMarkup(keyboard)
 
 def get_delete_keyboard(reminder_id):
     keyboard = [[InlineKeyboardButton("🗑️ Delete Goal", callback_data=f"del_{reminder_id}")]]
     return InlineKeyboardMarkup(keyboard)
+
+def get_dashboard_keyboard():
+    keyboard = [
+        [
+            InlineKeyboardButton("📜 Active Goals", callback_data="dash_goals"),
+            InlineKeyboardButton("📊 Statistics", callback_data="dash_stats")
+        ],
+        [
+            InlineKeyboardButton("📔 Vault Library", callback_data="dash_vault"),
+            InlineKeyboardButton("🏆 Milestones", callback_data="dash_milestones")
+        ],
+        [
+            InlineKeyboardButton("⚙️ Settings", callback_data="dash_settings")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_settings_keyboard(settings):
+    briefing_label = "✅ Briefing: ON" if settings.get('briefing_enabled', 1) else "❌ Briefing: OFF"
+    tz_label = f"🌍 Timezone: UTC{settings.get('timezone_offset', 5.5):+}"
+    keyboard = [
+        [InlineKeyboardButton(briefing_label, callback_data="toggle_briefing")],
+        [InlineKeyboardButton(tz_label, callback_data="tz_select")],
+        [InlineKeyboardButton("🔙 Back to Dashboard", callback_data="back_to_dash")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_tz_keyboard():
+    offsets = [-8, -5, 0, 1, 2, 3, 5.5, 8, 9]
+    keyboard = []
+    row = []
+    for o in offsets:
+        row.append(InlineKeyboardButton(f"UTC{o:+}", callback_data=f"set_tz_{o}"))
+        if len(row) == 3:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("🔙 Back to Settings", callback_data="dash_settings")])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_rank(level):
+    if level < 3: return "🌱 Novice Striver"
+    if level < 7: return "⚡ Productivity Architect"
+    if level < 12: return "🧠 Elite Scheduler"
+    return "🔥 Nexus Grandmaster"
 
 # ---------------- ELITE UI ENGINE ----------------
 
@@ -388,23 +451,61 @@ temp_reminders = {}
 
 # ---------------- COMMANDS ----------------
 
+def generate_ai_response(prompt, default_fallback):
+    if not GEMINI_KEY:
+        return default_fallback
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }],
+            "generationConfig": {
+                "maxOutputTokens": 300,
+                "temperature": 0.7
+            }
+        }
+        import json
+        import urllib.request
+        req = urllib.request.Request(
+            url, 
+            data=json.dumps(payload).encode('utf-8'), 
+            headers=headers, 
+            method='POST'
+        )
+        with urllib.request.urlopen(req, timeout=12) as response:
+            res_data = json.loads(response.read().decode('utf-8'))
+            ai_text = res_data['candidates'][0]['content']['parts'][0]['text']
+            return ai_text.strip()
+    except Exception as e:
+        logger.error(f"Gemini API failure: {e}")
+        return default_fallback
+
 def start(update: Update, context: CallbackContext):
     send_typing(update, context)
     user = update.effective_user
     db.get_user_settings(user.id) # Ensure user exists in settings
     name = f"{user.first_name} {user.last_name}" if user.last_name else user.first_name
+    xp_data = db.get_xp_stats(user.id)
+    rank = get_rank(xp_data['level'])
+    
     content = (
-        f"Welcome, {name} 👋\n\n"
-        "I am your smart productivity companion.\n"
-        "Manage your studies, tasks, and focus efficiently.\n\n"
-        "🚀 <b>Get started:</b>\n"
-        "• /reminder — Set a new task\n"
-        "• /pomodoro — Start focus session\n"
-        "• /list — View your schedule\n"
-        "• /stats — Track productivity\n\n"
-        "👉 <b>Try this:</b> Type <code>/reminder</code> to set your first task!"
+        f"👋 <b>Welcome, {name}!</b>\n\n"
+        f"Rank: <b>{rank}</b> (Level {xp_data['level']})\n\n"
+        "I am your advanced cognitive productivity command center. Use the controls below to synchronize goals, vaults, and strategies."
     )
-    update.message.reply_text(EliteUI.wrap(content), parse_mode=ParseMode.HTML, reply_markup=get_main_menu_keyboard())
+    update.message.reply_text(EliteUI.wrap(content), parse_mode=ParseMode.HTML, reply_markup=get_dashboard_keyboard())
+
+def dashboard_command(update: Update, context: CallbackContext):
+    start(update, context)
+
+def settings_command(update: Update, context: CallbackContext):
+    send_typing(update, context)
+    chat_id = update.effective_chat.id
+    settings = db.get_user_settings(chat_id)
+    query_text = "⚙️ <b>Nexus Settings panel:</b>\n\nConfigure your briefings and timezone options."
+    update.message.reply_text(EliteUI.wrap(query_text, "Settings"), parse_mode=ParseMode.HTML, reply_markup=get_settings_keyboard(settings))
 
 def help_command(update: Update, context: CallbackContext):
     start(update, context)
@@ -671,7 +772,6 @@ def milestone_command(update: Update, context: CallbackContext):
 
 def summarize_command(update: Update, context: CallbackContext):
     send_typing(update, context)
-    # AI Mock Logic (until API key is added)
     content = " ".join(context.args)
     if not content and update.message.reply_to_message:
         content = update.message.reply_to_message.text or ""
@@ -680,8 +780,10 @@ def summarize_command(update: Update, context: CallbackContext):
         update.message.reply_text("🤔 Provide text to summarize or reply to a message.", parse_mode=ParseMode.HTML)
         return
     
-    # Simple rule-based summary for now
-    summary = f"🔹 {content[:100]}...\n\n<i>[AI Insight: Key focus area identified. Recommended review in 24h.]</i>"
+    prompt = f"Summarize the following study note content concisely in bullet points, and add a brief 'AI Insight' at the end:\n\n{content}"
+    fallback = f"🔹 {content[:100]}...\n\n<i>[AI Insight: Key focus area identified. Recommended review in 24h.]</i>"
+    
+    summary = generate_ai_response(prompt, fallback)
     update.message.reply_text(EliteUI.wrap(f"🧠 <b>AI Study Architect:</b>\n\n{summary}", "Nexus Intelligence"), parse_mode=ParseMode.HTML)
 
 def quiz_command(update: Update, context: CallbackContext):
@@ -694,7 +796,16 @@ def quiz_command(update: Update, context: CallbackContext):
     import random
     note = random.choice(notes)
     content = note['content'] or "this attached media"
-    update.message.reply_text(EliteUI.wrap(f"🧠 <b>Nexus Knowledge Verification:</b>\n\nCan you explain the core concept behind: \"{content}\"?\n\n<i>[Think deeply, then tap 'Done' when you've reviewed the concept.]</i>", "AI Quiz"), parse_mode=ParseMode.HTML)
+    
+    prompt = (
+        f"Generate a single conceptual review question with 3 multiple-choice options (A, B, C) based on this note content:\n"
+        f"\"{content}\"\n"
+        f"Format it beautifully in HTML tags (e.g. <b>Question</b>, <code>Options</code>). Do not print the answer. Just prompt the user to think."
+    )
+    fallback = f"Can you explain the core concept behind: \"{content}\"?\n\n<i>[Think deeply, then tap 'Done' when you've reviewed the concept.]</i>"
+    
+    quiz_text = generate_ai_response(prompt, fallback)
+    update.message.reply_text(EliteUI.wrap(f"🧠 <b>AI Quiz Architect:</b>\n\n{quiz_text}", "AI Quiz"), parse_mode=ParseMode.HTML)
 
 def group_pomo_command(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
@@ -786,22 +897,51 @@ def handle_callback(update: Update, context: CallbackContext):
         query.answer("Victory!", show_alert=False)
 
     elif data.startswith("snooze_"):
-        rid = data.replace("snooze_", "")
+        parts = data.split("_")
+        if len(parts) == 3:
+            minutes = int(parts[1])
+            rid = parts[2]
+        else:
+            minutes = 15
+            rid = data.replace("snooze_", "")
+            
         with db._get_conn() as conn:
             old = conn.execute("SELECT message FROM reminders WHERE id = ?", (rid,)).fetchone()
             if old:
-                new_time = (datetime.now() + timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M:%S")
+                new_time = (datetime.now() + timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
                 conn.execute("INSERT INTO reminders (chat_id, message, remind_time) VALUES (?, ?, ?)",
                              (chat_id, old['message'], new_time))
                 conn.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (rid,))
-                query.edit_message_text(EliteUI.wrap("💤 <b>Strategic Delay.</b>\nRescheduled for +15 minutes.", "Snooze Active"), parse_mode=ParseMode.HTML)
-                query.answer("Snoozed.")
+                query.edit_message_text(EliteUI.wrap(f"💤 <b>Strategic Delay.</b>\nRescheduled for +{minutes} minutes.", f"Snooze {minutes}m"), parse_mode=ParseMode.HTML)
+                query.answer(f"Snoozed for {minutes}m.")
 
     elif data.startswith("del_"):
         rid = data.replace("del_", "")
         if db.delete_reminder(rid, chat_id):
-            query.edit_message_text(EliteUI.wrap("🗑️ <b>Goal Liquidated.</b>\nItem removed from schedule.", "Success"), parse_mode=ParseMode.HTML)
-            query.answer("Deleted.")
+            query.answer("Goal Liquidated.")
+            if query.message.text and "Active Study Targets" in query.message.text:
+                rows = db.get_pending_reminders(chat_id)
+                settings = db.get_user_settings(chat_id)
+                offset = settings.get('timezone_offset', 5.5)
+                
+                content = "📋 <b>Active Study Targets:</b>\n\n"
+                keyboard = []
+                if not rows:
+                    content += "📭 No active study goals found."
+                else:
+                    for r in rows:
+                        local_time = to_local_time(r['remind_time'], offset)
+                        content += f"🔔 <b>{r['message']}</b>\n⏰ <code>{local_time}</code>\n\n"
+                        keyboard.append([InlineKeyboardButton(f"🗑️ Delete ID {r['id']}", callback_data=f"del_{r['id']}")])
+                
+                keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_to_dash")])
+                query.edit_message_text(
+                    EliteUI.wrap(content, "Active Schedule"),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            else:
+                query.edit_message_text(EliteUI.wrap("🗑️ <b>Goal Liquidated.</b>\nItem removed from schedule.", "Success"), parse_mode=ParseMode.HTML)
         else:
             query.answer("⚠️ Item not found.", show_alert=True)
 
@@ -834,6 +974,159 @@ def handle_callback(update: Update, context: CallbackContext):
             parse_mode=ParseMode.HTML
         )
         query.answer("Backup Generated.")
+
+    elif data == "dash_goals":
+        rows = db.get_pending_reminders(chat_id)
+        settings = db.get_user_settings(chat_id)
+        offset = settings.get('timezone_offset', 5.5)
+        
+        content = "📋 <b>Active Study Targets:</b>\n\n"
+        keyboard = []
+        if not rows:
+            content += "📭 No active study goals found."
+        else:
+            for r in rows:
+                local_time = to_local_time(r['remind_time'], offset)
+                content += f"🔔 <b>{r['message']}</b>\n⏰ <code>{local_time}</code>\n\n"
+                keyboard.append([InlineKeyboardButton(f"🗑️ Delete ID {r['id']}", callback_data=f"del_{r['id']}")])
+        
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_to_dash")])
+        query.edit_message_text(
+            EliteUI.wrap(content, "Active Schedule"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        query.answer("Targets Loaded.")
+
+    elif data == "dash_stats":
+        stats = db.get_stats(chat_id)
+        xp_data = db.get_xp_stats(chat_id)
+        hours = stats['pomo_time'] // 60
+        mins = stats['pomo_time'] % 60
+        
+        xp_card = EliteUI.xp_card(xp_data['level'], xp_data['xp'], xp_data['level'] * 100)
+        
+        content = (
+            f"{xp_card}\n\n"
+            "📈 <b>Performance Overview:</b>\n"
+            f"✅ Goals Crushed: <code>{stats['sent']}</code>\n"
+            f"⏳ Future Goals: <code>{stats['pending']}</code>\n"
+            f"🧘 Sessions: <code>{stats['pomo_count']}</code>\n"
+            f"⏱️ Total Focus: <code>{hours}h {mins}m</code>\n\n"
+            f"<b>Elite Progress:</b>\n"
+            f"{EliteUI.progress_bar(stats['sent'], stats['sent'] + stats['pending'] if stats['sent'] + stats['pending'] > 0 else 1)}"
+        )
+        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="back_to_dash")]]
+        query.edit_message_text(
+            EliteUI.wrap(content, "Nexus Productivity"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        query.answer("Stats Loaded.")
+
+    elif data == "dash_vault":
+        notes = db.get_notes(chat_id)
+        content = "📔 <b>Resource Vault Library:</b>\n\n"
+        if not notes:
+            content += "📭 Your vault is empty."
+        else:
+            for idx, n in enumerate(notes[:5]):
+                c = n['content'] or "[Media Content]"
+                if len(c) > 40: c = c[:40] + "..."
+                content += f"🔹 {idx+1}. {c} (<i>{n['created_at'][5:16]}</i>)\n"
+            if len(notes) > 5:
+                content += f"\n<i>...and {len(notes) - 5} more items.</i>"
+        
+        keyboard = [
+            [InlineKeyboardButton("📤 Export Vault Backup", callback_data="export_data")],
+            [InlineKeyboardButton("🔙 Back", callback_data="back_to_dash")]
+        ]
+        query.edit_message_text(
+            EliteUI.wrap(content, "Resource Vault"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        query.answer("Vault Loaded.")
+
+    elif data == "dash_milestones":
+        milestones = db.get_milestones(chat_id)
+        content = "📈 <b>Exam Countdown Strategy:</b>\n\n"
+        if not milestones:
+            content += "📭 No countdown milestones registered."
+        else:
+            for m in milestones:
+                content += f"🎯 <b>{m['title']}</b>\n📅 Date: <code>{m['target_date']}</code>\n\n"
+        
+        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="back_to_dash")]]
+        query.edit_message_text(
+            EliteUI.wrap(content, "Strategy Milestones"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        query.answer("Milestones Loaded.")
+
+    elif data == "dash_settings":
+        settings = db.get_user_settings(chat_id)
+        query_text = "⚙️ <b>Nexus Settings panel:</b>\n\nConfigure your briefings and timezone options."
+        query.edit_message_text(
+            EliteUI.wrap(query_text, "Settings"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_settings_keyboard(settings)
+        )
+        query.answer("Settings Loaded.")
+
+    elif data == "toggle_briefing":
+        settings = db.get_user_settings(chat_id)
+        new_val = 0 if settings.get('briefing_enabled', 1) else 1
+        db.update_briefing(chat_id, new_val)
+        settings['briefing_enabled'] = new_val
+        
+        query_text = "⚙️ <b>Nexus Settings panel:</b>\n\nConfigure your briefings and timezone options."
+        query.edit_message_text(
+            EliteUI.wrap(query_text, "Settings"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_settings_keyboard(settings)
+        )
+        query.answer("Briefing Toggled.")
+
+    elif data == "tz_select":
+        query_text = "🌍 <b>Timezone offset synchronization:</b>\n\nSelect your current UTC timezone offset:"
+        query.edit_message_text(
+            EliteUI.wrap(query_text, "Timezone Select"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_tz_keyboard()
+        )
+        query.answer("Select Timezone.")
+
+    elif data.startswith("set_tz_"):
+        offset = float(data.replace("set_tz_", ""))
+        db.update_timezone(chat_id, offset)
+        settings = db.get_user_settings(chat_id)
+        
+        query_text = "⚙️ <b>Nexus Settings panel:</b>\n\nConfigure your briefings and timezone options."
+        query.edit_message_text(
+            EliteUI.wrap(query_text, "Settings"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_settings_keyboard(settings)
+        )
+        query.answer(f"Timezone: UTC{offset:+}")
+
+    elif data == "back_to_dash":
+        name = f"{query.from_user.first_name} {query.from_user.last_name}" if query.from_user.last_name else query.from_user.first_name
+        xp_data = db.get_xp_stats(chat_id)
+        rank = get_rank(xp_data['level'])
+        
+        content = (
+            f"👋 <b>Welcome, {name}!</b>\n\n"
+            f"Rank: <b>{rank}</b> (Level {xp_data['level']})\n\n"
+            "I am your advanced cognitive productivity command center. Use the controls below to synchronize goals, vaults, and strategies."
+        )
+        query.edit_message_text(
+            EliteUI.wrap(content),
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_dashboard_keyboard()
+        )
+        query.answer("Dashboard Loaded.")
 
 def time_command(update: Update, context: CallbackContext):
     settings = db.get_user_settings(update.effective_chat.id)
@@ -1010,7 +1303,9 @@ def main():
             CommandHandler("quiz", quiz_command, run_async=True),
             CommandHandler("milestone", milestone_command, run_async=True),
             CommandHandler("group_pomo", group_pomo_command, run_async=True),
-            CommandHandler("data", data_command, run_async=True)
+            CommandHandler("data", data_command, run_async=True),
+            CommandHandler("dashboard", dashboard_command, run_async=True),
+            CommandHandler("settings", settings_command, run_async=True)
         ]
         for handler in handlers:
             dp.add_handler(handler)
@@ -1025,6 +1320,8 @@ def main():
         # Menu Sync
         commands = [
             ("start", "Launch Nexus Interface"),
+            ("dashboard", "Interactive dashboard"),
+            ("settings", "Configure options"),
             ("reminder", "Set study goal"),
             ("pomodoro", "Focus session"),
             ("list", "View schedule"),
