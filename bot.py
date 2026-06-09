@@ -87,14 +87,26 @@ STUDY_QUOTES = [
 class DatabaseManager:
     def __init__(self, db_path=None):
         self.db_path = db_path or os.getenv("DB_PATH", "reminders.db")
-        # Ensure the directory for the database file exists
+        self._init_db_with_fallback()
+
+    def _init_db_with_fallback(self):
         db_dir = os.path.dirname(self.db_path)
         if db_dir and not os.path.exists(db_dir):
             try:
                 os.makedirs(db_dir, exist_ok=True)
             except Exception as e:
-                logger.error(f"Failed to create database directory {db_dir}: {e}")
-        self._init_db()
+                logger.error(f"Failed to create database directory {db_dir}: {e}. Falling back to local reminders.db.")
+                self.db_path = "reminders.db"
+        
+        try:
+            self._init_db()
+        except sqlite3.OperationalError as e:
+            if self.db_path != "reminders.db":
+                logger.error(f"Failed to initialize database at {self.db_path}: {e}. Falling back to local reminders.db.")
+                self.db_path = "reminders.db"
+                self._init_db()
+            else:
+                raise e
 
     @contextmanager
     def _get_conn(self):
