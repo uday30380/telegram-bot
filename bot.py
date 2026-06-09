@@ -86,6 +86,13 @@ STUDY_QUOTES = [
 class DatabaseManager:
     def __init__(self, db_path=None):
         self.db_path = db_path or os.getenv("DB_PATH", "reminders.db")
+        # Ensure the directory for the database file exists
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir and not os.path.exists(db_dir):
+            try:
+                os.makedirs(db_dir, exist_ok=True)
+            except Exception as e:
+                logger.error(f"Failed to create database directory {db_dir}: {e}")
         self._init_db()
 
     @contextmanager
@@ -784,8 +791,9 @@ def handle_callback(update: Update, context: CallbackContext):
             old = conn.execute("SELECT message FROM reminders WHERE id = ?", (rid,)).fetchone()
             if old:
                 new_time = (datetime.now() + timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M:%S")
-                db.add_reminder(chat_id, old['message'], new_time)
-                db.mark_as_sent(rid)
+                conn.execute("INSERT INTO reminders (chat_id, message, remind_time) VALUES (?, ?, ?)",
+                             (chat_id, old['message'], new_time))
+                conn.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (rid,))
                 query.edit_message_text(EliteUI.wrap("💤 <b>Strategic Delay.</b>\nRescheduled for +15 minutes.", "Snooze Active"), parse_mode=ParseMode.HTML)
                 query.answer("Snoozed.")
 
@@ -1042,8 +1050,8 @@ def main():
         print("View logs in 'study_mate.log'. Parallel workers: 32.")
         
         updater.idle()
-    except Exception as e:
-        logger.error(f"Nexus Crash: {e}")
+    except Exception:
+        logger.exception("Nexus Crash:")
     finally:
         if os.path.exists(lock_file):
             try: os.remove(lock_file)
