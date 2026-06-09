@@ -524,6 +524,27 @@ def stats_command(update: Update, context: CallbackContext):
         f"{EliteUI.progress_bar(data['sent'], data['sent'] + data['pending'] if data['sent'] + data['pending'] > 0 else 1)}"
     )
     update.message.reply_text(EliteUI.wrap(content, "Nexus Productivity"), parse_mode=ParseMode.HTML)
+
+def data_command(update: Update, context: CallbackContext):
+    send_typing(update, context)
+    chat_id = update.effective_chat.id
+    stats = db.get_stats(chat_id)
+    notes = db.get_notes(chat_id)
+    milestones = db.get_milestones(chat_id)
+    
+    content = (
+        "📂 <b>Your Nexus Data Vault:</b>\n\n"
+        f"📋 Active targets: <code>{stats['pending']}</code>\n"
+        f"✅ Crushed targets: <code>{stats['sent']}</code>\n"
+        f"📔 Vault Notes: <code>{len(notes)}</code>\n"
+        f"📈 Milestones: <code>{len(milestones)}</code>\n\n"
+        "💡 <i>To backup your library, press the button below.</i>"
+    )
+    
+    keyboard = [[
+        InlineKeyboardButton("📤 Export JSON Backup", callback_data="export_data")
+    ]]
+    update.message.reply_text(EliteUI.wrap(content, "Data Center"), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
   
 def stop_pomo_callback(update: Update, context: CallbackContext):
     query = update.callback_query
@@ -745,6 +766,33 @@ def handle_callback(update: Update, context: CallbackContext):
     elif data.startswith("stop_pomo_"):
         stop_pomo_callback(update, context)
 
+    elif data == "export_data":
+        notes = db.get_notes(chat_id)
+        reminders = db.get_pending_reminders(chat_id)
+        milestones = db.get_milestones(chat_id)
+        
+        backup = {
+            "reminders": reminders,
+            "notes": notes,
+            "milestones": milestones,
+            "exported_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        }
+        
+        import json
+        import io
+        
+        bio = io.BytesIO(json.dumps(backup, indent=2).encode('utf-8'))
+        bio.name = f"studymate_backup_{chat_id}.json"
+        
+        context.bot.send_document(
+            chat_id=chat_id, 
+            document=bio, 
+            filename=bio.name,
+            caption="🔒 <b>Encrypted Backup Archive</b>\nContains all targets, vault notes, and milestones.",
+            parse_mode=ParseMode.HTML
+        )
+        query.answer("Backup Generated.")
+
 def time_command(update: Update, context: CallbackContext):
     settings = db.get_user_settings(update.effective_chat.id)
     offset = settings.get('timezone_offset', 5.5)
@@ -919,7 +967,8 @@ def main():
             CommandHandler("summarize", summarize_command, run_async=True),
             CommandHandler("quiz", quiz_command, run_async=True),
             CommandHandler("milestone", milestone_command, run_async=True),
-            CommandHandler("group_pomo", group_pomo_command, run_async=True)
+            CommandHandler("group_pomo", group_pomo_command, run_async=True),
+            CommandHandler("data", data_command, run_async=True)
         ]
         for handler in handlers:
             dp.add_handler(handler)
@@ -948,6 +997,7 @@ def main():
             ("admin", "Elite Control"),
             ("time", "Sync Time"),
             ("clear", "Cleanup"),
+            ("data", "Manage & Backup Data"),
             ("help", "Command Guide")
         ]
         updater.bot.set_my_commands(commands)
