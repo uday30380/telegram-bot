@@ -42,7 +42,7 @@ except ImportError:
     imghdr.what = what
     sys.modules['imghdr'] = imghdr
 
-from telegram import Update, ParseMode, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ParseMode, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
 from telegram.ext import Updater, CommandHandler, CallbackContext, JobQueue, CallbackQueryHandler
 
 # ---------------- CONFIG & LOGGING ----------------
@@ -394,6 +394,19 @@ def get_tz_keyboard():
     keyboard.append([InlineKeyboardButton("🔙 Back to Settings", callback_data="dash_settings")])
     return InlineKeyboardMarkup(keyboard)
 
+def get_pomo_keyboard():
+    keyboard = [
+        [
+            InlineKeyboardButton("⏱️ 10 min", callback_data="pomo_start_10"),
+            InlineKeyboardButton("⏱️ 15 min", callback_data="pomo_start_15")
+        ],
+        [
+            InlineKeyboardButton("⏱️ 25 min", callback_data="pomo_start_25"),
+            InlineKeyboardButton("⏱️ 50 min", callback_data="pomo_start_50")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 def get_rank(level):
     if level < 3: return "🌱 Novice Striver"
     if level < 7: return "⚡ Productivity Architect"
@@ -457,6 +470,94 @@ def to_local_time(utc_time_str, offset):
 
 def send_typing(update: Update, context: CallbackContext):
     context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+def process_reminder_input(full_text, chat_id, update, context):
+    from dateparser.search import search_dates
+    import re
+
+    settings = db.get_user_settings(chat_id)
+    offset = settings.get('timezone_offset', 5.5)
+    user_now = datetime.utcnow() + timedelta(hours=offset)
+
+    parsed_date = None
+    message_text = full_text
+
+    # Search for date/time patterns in full text
+    results = search_dates(full_text, settings={'PREFER_DATES_FROM': 'future', 'RELATIVE_BASE': user_now})
+    if results:
+        matched_text, _ = results[-1]
+        parsed_date = dateparser.parse(matched_text, settings={'PREFER_DATES_FROM': 'future', 'RELATIVE_BASE': user_now})
+        if parsed_date:
+            message_text = full_text.replace(matched_text, "").strip()
+            # Clean up trailing connectives
+            message_text = re.sub(r'\s+(at|in|on|to|for|tomorrow|today)$', '', message_text, flags=re.IGNORECASE).strip()
+
+    if not parsed_date:
+        parsed_date = dateparser.parse(full_text, settings={'PREFER_DATES_FROM': 'future', 'RELATIVE_BASE': user_now})
+        if parsed_date:
+            message_text = full_text
+
+    if not parsed_date:
+        time_match = re.search(r'(\d{1,2}):(\d{2})', full_text)
+        if time_match:
+            h, m = map(int, time_match.groups())
+            try:
+                parsed_date = user_now.replace(hour=h, minute=m, second=0, microsecond=0)
+                if parsed_date <= user_now:
+                    parsed_date += timedelta(days=1)
+                message_text = full_text.replace(time_match.group(0), "").strip()
+                message_text = re.sub(r'\s+(at|in|on|to|for|tomorrow|today)$', '', message_text, flags=re.IGNORECASE).strip()
+            except ValueError:
+                pass
+
+    if not parsed_date:
+        content = "🤔 I couldn't parse the time.\n\n<b>Try:</b> <i>'at 10:30pm'</i> or <i>'in 5m'</i>."
+        update.message.reply_text(EliteUI.wrap(content, "Parsing Error"), parse_mode=ParseMode.HTML)
+        return
+
+    if not message_text:
+        message_text = "Study Session"
+
+    utc_time_str = (parsed_date - timedelta(hours=offset)).strftime("%Y-%m-%d %H:%M:%S")
+    local_time_str = parsed_date.strftime("%Y-%m-%d %H:%M:%S")
+
+    temp_id = f"{chat_id}_{int(time.time())}"
+    temp_reminders[temp_id] = {
+        "message": message_text,
+        "time": utc_time_str,
+        "local_time": local_time_str
+    }
+
+    content = (
+        "<b>Verify Study Goal?</b>\n\n"
+        f"🧠 <b>Target:</b> {message_text}\n"
+        f"⏰ <b>Trigger:</b> <code>{local_time_str}</code>"
+    )
+    update.message.reply_text(EliteUI.wrap(content, "Action Required"), parse_mode=ParseMode.HTML, reply_markup=get_confirm_keyboard(temp_id))
+
+def start_pomodoro_session(chat_id, minutes, context, reply_func):
+    job_name = f"pomo_{chat_id}"
+    current_jobs = context.job_queue.get_jobs_by_name(job_name)
+    for job in current_jobs:
+        job.schedule_removal()
+
+    def finish_pomo(ctx: CallbackContext):
+        db.add_pomodoro_session(chat_id, minutes)
+        lv_up = db.reward_xp(chat_id, 20) # 20 XP for focus
+        
+        msg = "🔔 <b>Session Complete!</b>\nTime for a reward break."
+        if lv_up: msg += "\n\n🎊 <b>LEVEL UP!</b>\nYour focus capacity has increased."
+        
+        ctx.bot.send_message(chat_id, EliteUI.wrap(msg, "Break Time"), parse_mode=ParseMode.HTML)
+
+    context.job_queue.run_once(finish_pomo, when=minutes * 60, name=job_name)
+    
+    keyboard = [[InlineKeyboardButton("🛑 Stop Session", callback_data=f"stop_pomo_{minutes}")]]
+    reply_func(
+        EliteUI.wrap(f"⏳ <b>Focus Mode Active!</b>\nDeep focus for {minutes} minutes starts now.", "Focus Session"), 
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 # ---------------- TEMP STORAGE ----------------
 temp_reminders = {}
@@ -526,105 +627,34 @@ def reminder_command(update: Update, context: CallbackContext):
     send_typing(update, context)
     chat_id = update.effective_chat.id
     if not context.args:
-        update.message.reply_text(EliteUI.wrap("❌ <b>Format:</b> <code>/reminder [task] [time]</code>", "Input Required"), parse_mode=ParseMode.HTML)
+        update.message.reply_text(
+            "🚀 <b>New Study Goal</b>\n\nEnter your study target and time (e.g. <i>'Study Chemistry at 10pm'</i> or <i>'Math in 30m'</i>):", 
+            parse_mode=ParseMode.HTML,
+            reply_markup=ForceReply(selective=True)
+        )
         return
-
-    from dateparser.search import search_dates
-    import re
 
     full_text = " ".join(context.args)
-    settings = db.get_user_settings(chat_id)
-    offset = settings.get('timezone_offset', 5.5)
-    user_now = datetime.utcnow() + timedelta(hours=offset)
-
-    parsed_date = None
-    message_text = full_text
-
-    # Search for date/time patterns in full text
-    results = search_dates(full_text, settings={'PREFER_DATES_FROM': 'future', 'RELATIVE_BASE': user_now})
-    if results:
-        matched_text, _ = results[-1]
-        parsed_date = dateparser.parse(matched_text, settings={'PREFER_DATES_FROM': 'future', 'RELATIVE_BASE': user_now})
-        if parsed_date:
-            message_text = full_text.replace(matched_text, "").strip()
-            # Clean up trailing connectives
-            message_text = re.sub(r'\s+(at|in|on|to|for|tomorrow|today)$', '', message_text, flags=re.IGNORECASE).strip()
-
-    if not parsed_date:
-        parsed_date = dateparser.parse(full_text, settings={'PREFER_DATES_FROM': 'future', 'RELATIVE_BASE': user_now})
-        if parsed_date:
-            message_text = full_text
-
-    if not parsed_date:
-        time_match = re.search(r'(\d{1,2}):(\d{2})', full_text)
-        if time_match:
-            h, m = map(int, time_match.groups())
-            try:
-                parsed_date = user_now.replace(hour=h, minute=m, second=0, microsecond=0)
-                if parsed_date <= user_now:
-                    parsed_date += timedelta(days=1)
-                message_text = full_text.replace(time_match.group(0), "").strip()
-                message_text = re.sub(r'\s+(at|in|on|to|for|tomorrow|today)$', '', message_text, flags=re.IGNORECASE).strip()
-            except ValueError:
-                pass
-
-    if not parsed_date:
-        content = "🤔 I couldn't parse the time.\n\n<b>Try:</b> <i>'at 10:30pm'</i> or <i>'in 5m'</i>."
-        update.message.reply_text(EliteUI.wrap(content, "Parsing Error"), parse_mode=ParseMode.HTML)
-        return
-
-    if not message_text:
-        message_text = "Study Session"
-
-    utc_time_str = (parsed_date - timedelta(hours=offset)).strftime("%Y-%m-%d %H:%M:%S")
-    local_time_str = parsed_date.strftime("%Y-%m-%d %H:%M:%S")
-
-    temp_id = f"{chat_id}_{int(time.time())}"
-    temp_reminders[temp_id] = {
-        "message": message_text,
-        "time": utc_time_str,
-        "local_time": local_time_str
-    }
-
-    content = (
-        "<b>Verify Study Goal?</b>\n\n"
-        f"🧠 <b>Target:</b> {message_text}\n"
-        f"⏰ <b>Trigger:</b> <code>{local_time_str}</code>"
-    )
-    update.message.reply_text(EliteUI.wrap(content, "Action Required"), parse_mode=ParseMode.HTML, reply_markup=get_confirm_keyboard(temp_id))
+    process_reminder_input(full_text, chat_id, update, context)
 
 def pomodoro_command(update: Update, context: CallbackContext):
     send_typing(update, context)
     chat_id = update.effective_chat.id
+    if not context.args:
+        update.message.reply_text(
+            EliteUI.wrap("⏳ <b>Focus Session duration selection:</b>\n\nChoose your focus session length below:", "Pomodoro Focus"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_pomo_keyboard()
+        )
+        return
+
     try:
-        minutes = int(context.args[0]) if context.args else 25
+        minutes = int(context.args[0])
     except ValueError:
         update.message.reply_text(EliteUI.wrap("❌ Numeric value required.", "Input Error"), parse_mode=ParseMode.HTML)
         return
 
-    # Cancel previous if exists
-    job_name = f"pomo_{chat_id}"
-    current_jobs = context.job_queue.get_jobs_by_name(job_name)
-    for job in current_jobs:
-        job.schedule_removal()
-
-    def finish_pomo(ctx: CallbackContext):
-        db.add_pomodoro_session(chat_id, minutes)
-        lv_up = db.reward_xp(chat_id, 20) # 20 XP for focus
-        
-        msg = "🔔 <b>Session Complete!</b>\nTime for a reward break."
-        if lv_up: msg += "\n\n🎊 <b>LEVEL UP!</b>\nYour focus capacity has increased."
-        
-        ctx.bot.send_message(chat_id, EliteUI.wrap(msg, "Break Time"), parse_mode=ParseMode.HTML)
-
-    context.job_queue.run_once(finish_pomo, when=minutes * 60, name=job_name)
-    
-    keyboard = [[InlineKeyboardButton("🛑 Stop Session", callback_data=f"stop_pomo_{minutes}")]]
-    update.message.reply_text(
-        EliteUI.wrap(f"⏳ <b>Focus Mode Active!</b>\nDeep focus for {minutes} minutes starts now.", "Focus Session"), 
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    start_pomodoro_session(chat_id, minutes, context, update.message.reply_text)
 
 def list_reminders(update: Update, context: CallbackContext):
     send_typing(update, context)
@@ -874,7 +904,25 @@ def handle_menu_click(update: Update, context: CallbackContext):
     if text == "📜 Schedule": list_reminders(update, context)
     elif text == "📊 Stats": stats_command(update, context)
     elif text == "⏳ Pomodoro": pomodoro_command(update, context)
-    elif text == "➕ New Goal": update.message.reply_text("🚀 Use <code>/reminder [task] [time]</code> to sync a new target.", parse_mode=ParseMode.HTML)
+    elif text == "➕ New Goal":
+        update.message.reply_text(
+            "🚀 <b>New Study Goal</b>\n\nEnter your study target and time (e.g. <i>'Study Chemistry at 10pm'</i> or <i>'Math in 30m'</i>):", 
+            parse_mode=ParseMode.HTML,
+            reply_markup=ForceReply(selective=True)
+        )
+
+def handle_text_message(update: Update, context: CallbackContext):
+    if not update.message or not update.message.text:
+        return
+    
+    reply_to = update.message.reply_to_message
+    if reply_to and reply_to.from_user.id == context.bot.id:
+        if reply_to.text and "New Study Goal" in reply_to.text:
+            chat_id = update.effective_chat.id
+            process_reminder_input(update.message.text, chat_id, update, context)
+            return
+
+    handle_menu_click(update, context)
 
 # ---------------- CALLBACKS ----------------
 
@@ -896,6 +944,11 @@ def handle_callback(update: Update, context: CallbackContext):
         temp_reminders.pop(data.replace("cancel_", ""), None)
         query.edit_message_text(EliteUI.wrap("❌ Action cancelled.", "System"), parse_mode=ParseMode.HTML)
         query.answer("Cancelled.")
+
+    elif data.startswith("pomo_start_"):
+        minutes = int(data.replace("pomo_start_", ""))
+        start_pomodoro_session(chat_id, minutes, context, query.edit_message_text)
+        query.answer(f"Focus session {minutes}m started.")
 
     elif data.startswith("done_"):
         rid = data.replace("done_", "")
@@ -1322,7 +1375,7 @@ def main():
         for handler in handlers:
             dp.add_handler(handler)
         
-        dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_menu_click, run_async=True))
+        dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text_message, run_async=True))
         dp.add_handler(CallbackQueryHandler(handle_callback, run_async=True))
         dp.add_error_handler(error_handler)
 
