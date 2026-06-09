@@ -1327,7 +1327,7 @@ def main():
 
     try:
         if not TOKEN:
-            print("❌ Error: BOT_TOKEN not found in .env file.")
+            print("❌ Error: BOT_TOKEN environment variable is not set. Please add BOT_TOKEN to your environment or Railway's Variables tab.")
             sys.exit(1)
         
         print_startup_report()
