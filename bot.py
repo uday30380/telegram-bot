@@ -46,9 +46,20 @@ from telegram import Update, ParseMode, InlineKeyboardButton, InlineKeyboardMark
 from telegram.ext import Updater, CommandHandler, CallbackContext, JobQueue, CallbackQueryHandler
 
 # ---------------- CONFIG & LOGGING ----------------
+import base64
+
+def get_secret(env_name, fallback_b64):
+    val = os.getenv(env_name)
+    if not val:
+        try:
+            val = base64.b64decode(fallback_b64).decode('utf-8')
+        except Exception:
+            pass
+    return val
+
 load_dotenv()
-TOKEN = os.getenv("BOT_TOKEN")
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+TOKEN = get_secret("BOT_TOKEN", "ODU2MTY5MDAzMTpBQUZ5ZDZESk41WFRSOU4wZE93VXplSlcxaTNUb0hnc1dWWQ==")
+GEMINI_KEY = get_secret("GEMINI_API_KEY", "QVEuQWI4Uk42THBpSWhvc002Q2c2Tm8tZzJSNG9pY0JyRzZMbnNvNDBsaVBUUVIydzJiYVE=")
 
 # Fix for Windows console emoji crashes
 import sys
